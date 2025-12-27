@@ -125,6 +125,10 @@ icontool --edit "DiskObject:Gadget:Width=64" --edit "DiskObject:Gadget:Height=48
 **DrawerData**:
 - `DrawerData:CurrentX`, `DrawerData:CurrentY`
 
+**DrawerData2** (OS 2.x extended drawer data):
+- `DrawerData2:Flags` - Drawer flags (4 bytes)
+- `DrawerData2:ViewModes` - View mode settings (2 bytes)
+
 **Icon** / **IconSelect** (image headers):
 - `Icon:LeftEdge`, `TopEdge`, `Width`, `Height`, `Depth`
 - `Icon:PlanePick`, `PlaneOnOff`
@@ -205,7 +209,7 @@ icontool --winsize 640,480 MyIcon.info
 Export embedded icons to PNG files (requires pypng):
 
 ```bash
-# Export main icon
+# Export main icon (uses GlowIcons if available)
 icontool --export-icon icon.png MyIcon.info
 
 # Export select (highlighted) icon
@@ -215,9 +219,42 @@ icontool --export-select-icon icon_select.png MyIcon.info
 icontool --export-icon main.png --export-select-icon select.png MyIcon.info
 ```
 
-Icons are exported using the appropriate Workbench palette:
-- **WB 1.3**: Blue, white, black, orange + 4 additional colors
-- **WB 2.0+**: Gray, black, white, blue, red, green, dark blue, orange
+### GlowIcons Support
+
+When an icon contains GlowIcons data (FORM ICON), icontool automatically exports the higher-quality GlowIcons image instead of the traditional planar image. GlowIcons support:
+- IMAG chunks (palette-mapped compressed images)
+- ARGB chunks (OS4 true-color images)
+- Proper transparency from the icon data
+
+To force export of the traditional planar image:
+
+```bash
+icontool --planar --export-icon icon.png MyIcon.info
+```
+
+### Transparency Options
+
+Control how transparency is handled for planar images:
+
+```bash
+# Edge-connected transparency (default) - only color 0 pixels connected to
+# the image border are transparent. Interior color 0 stays opaque.
+# Best for MagicWB icons that use gray (color 0) inside the icon.
+icontool --transparency=edge --export-icon icon.png MyIcon.info
+
+# All color 0 pixels transparent (classic behavior)
+icontool --transparency=all --export-icon icon.png MyIcon.info
+
+# No transparency - fully opaque image
+icontool --transparency=none --export-icon icon.png MyIcon.info
+```
+
+### Palettes
+
+Icons are exported using the appropriate Workbench palette based on depth and version:
+- **WB 1.3** (8 colors): Blue, white, black, orange, gray, light gray, brown, yellow
+- **WB 2.0+** (8 colors): Gray, black, white, blue, red, green, dark blue, orange
+- **16-color** (for 4+ plane icons): Extended MagicWB-style palette
 
 ## PNG Import
 
@@ -232,11 +269,19 @@ icontool --import-select-icon newicon_sel.png MyIcon.info
 ```
 
 The import process:
-1. Reads the PNG file
-2. Quantizes colors to both WB1.3 and WB2.0 palettes
-3. Selects the palette with lower color error
-4. Determines minimum bit depth needed (1-3 planes)
-5. Updates gadget dimensions if the new icon is larger
+1. Reads the PNG file (supports RGB and RGBA)
+2. Transparent pixels (alpha < 128) are mapped to color 0 (background)
+3. Quantizes colors to WB1.3, WB2.0, and 16-color palettes
+4. Automatically selects the palette with lowest color error
+5. Determines minimum bit depth needed (1-4 planes)
+6. Updates gadget dimensions if the new icon is larger
+
+### Transparency Handling
+
+RGBA PNGs with transparency are fully supported:
+- Transparent pixels become color 0 (background)
+- Semi-transparent pixels (alpha < 128) are treated as transparent
+- The tool reports when transparent pixels are detected
 
 ## Output Options
 
@@ -328,16 +373,51 @@ icontool --export-icon temp.png MyIcon.info
 icontool --import-icon temp.png MyIcon.info
 ```
 
+### Edit drawer view modes
+
+```bash
+# Set drawer view mode (requires OS 2.x icon)
+icontool --edit "DrawerData2:ViewModes=2" MyDrawer.info
+
+# View current drawer flags
+icontool --list -v MyDrawer.info | grep DrawerData2
+```
+
+### Compare GlowIcons vs planar export
+
+```bash
+# Export GlowIcons version (higher quality, if available)
+icontool --export-icon glow.png MyIcon.info
+
+# Export traditional planar version
+icontool --planar --export-icon planar.png MyIcon.info
+
+# Export planar with different transparency modes
+icontool --planar --transparency=edge --export-icon edge.png MyIcon.info
+icontool --planar --transparency=all --export-icon all.png MyIcon.info
+```
+
 ## File Format Notes
 
 icontool handles standard Amiga `.info` files including:
 
 - **DiskObject** header (78 bytes)
-- **DrawerData** for disk/drawer icons (56 bytes + OS2.x extension)
+- **DrawerData** for disk/drawer icons (56 bytes)
+- **DrawerData2** OS 2.x extension (6 bytes: dd_Flags + dd_ViewModes)
 - **Image** structures with planar bitmap data
 - **DefaultTool** string
 - **ToolTypes** string array
-- **GlowIcons** / NewIcons data (preserved but not modified)
+- **GlowIcons** FORM ICON data (parsed for export, preserved on modification)
+- **NewIcons** ToolTypes data (preserved but not parsed)
+
+### GlowIcons Format
+
+GlowIcons (OS 3.5+) append IFF FORM ICON data after the traditional icon:
+- **FACE** chunk: Icon dimensions and flags
+- **IMAG** chunk: Palette-mapped image with RLE compression
+- **ARGB** chunk: OS4 true-color ARGB image data
+
+Note: The IMAG chunk stores IMAGE data first, then COLORMAP data (not the intuitive order).
 
 Icon types supported:
 | Type | Value | Description |

@@ -43,6 +43,18 @@ WB20_COLORS = [
     (0xEE, 0x99, 0x00),  # 7: orange
 ]
 
+# Extended 16-color palette for 4+ plane icons (MagicWB style)
+PALETTE_16 = WB20_COLORS + [
+    (0x00, 0x00, 0x00),  # 8: Black
+    (0xFF, 0x00, 0x00),  # 9: Red
+    (0x00, 0xFF, 0x00),  # 10: Green
+    (0xFF, 0xFF, 0x00),  # 11: Yellow
+    (0x00, 0x00, 0xFF),  # 12: Blue
+    (0xFF, 0x00, 0xFF),  # 13: Magenta
+    (0x00, 0xFF, 0xFF),  # 14: Cyan
+    (0xFF, 0xFF, 0xFF),  # 15: White
+]
+
 # DiskObject fixed header length used by Deark
 DISKOBJECT_LEN = 78
 
@@ -106,7 +118,14 @@ def _fmt_icon_type(v: int) -> str:
     return f"{v} ({names.get(v, '?')})"
 
 def _fmt_wb_version(v: int) -> str:
-    return f"{v} ({'OS1.x' if v == 0 else 'OS2.x'})"
+    # UserData low byte is the "revision" field
+    # 0 = OS1.x format (no dd_Flags/dd_ViewModes)
+    # 1 = OS2.x/v36+ format (has dd_Flags/dd_ViewModes after ToolWindow)
+    rev = v & 0xFF
+    if rev == 0:
+        return f"0x{v:X} (OS1.x, no DrawerData2)"
+    else:
+        return f"0x{v:X} (OS2.x/v36+, has DrawerData2)"
 
 def _fmt_position(v: int) -> str:
     if v == 0x80000000:
@@ -365,16 +384,349 @@ def build_tooltypes_table(entries: List[bytes]) -> bytes:
         out += e
     return bytes(out)
 
+def find_glowicons_form(buf: bytes, start_pos: int) -> int:
+    """
+    Search for FORM ICON chunk starting from start_pos.
+    Returns the position of "FORM" or -1 if not found.
+
+    This properly handles "FORM" appearing in ToolTypes (e.g., "FORMAT=0")
+    by verifying the chunk is actually "FORM....ICON".
+    """
+    pos = start_pos
+    while True:
+        # Search for "FORM"
+        form_pos = buf.find(b"FORM", pos)
+        if form_pos == -1:
+            return -1
+
+        # Check if we have enough data for the header
+        if len(buf) < form_pos + 12:
+            return -1
+
+        # Verify this is FORM ICON (not just "FORMAT" or other text)
+        form_type = buf[form_pos + 8:form_pos + 12]
+        if form_type == b"ICON":
+            return form_pos
+
+        # Not ICON, keep searching after this position
+        pos = form_pos + 1
+
+    return -1
+
+
 def detect_glowicons_tail(buf: bytes, pos: int) -> Optional[bytes]:
+    """
+    Detect GlowIcons FORM ICON data after traditional icon data.
+    Returns the FORM ICON chunk (and any trailing data) or remaining bytes.
+    """
     if pos < 0 or pos >= len(buf):
         return None
+
+    # Search for FORM ICON starting from pos
+    form_pos = find_glowicons_form(buf, pos)
+    if form_pos >= pos:
+        return bytes(buf[form_pos:])
+
+    # No FORM ICON found, but there might be other trailing data
     rem = len(buf) - pos
-    if rem >= 24:
-        if buf[pos:pos+4] == b"FORM" and buf[pos+8:pos+12] == b"ICON":
-            return bytes(buf[pos:])
     if rem > 0:
         return bytes(buf[pos:])
     return None
+
+
+# --- GlowIcons parsing ---
+
+def unpack_rle_8bit(data: bytes, expected_size: int) -> bytes:
+    """
+    Decompress 8-bit RLE data (icon.library format for colormap).
+    Similar to PackBits:
+    - n < 128: copy n+1 literal bytes
+    - n >= 128: repeat next byte (256-n)+1 times
+    """
+    result = bytearray()
+    i = 0
+
+    while i < len(data) and len(result) < expected_size:
+        if i + 1 > len(data):
+            break
+        n = data[i]
+        i += 1
+
+        if n < 128:
+            # Literal run: copy n+1 bytes
+            count = n + 1
+            result.extend(data[i:i + count])
+            i += count
+        else:
+            # Replicate run: repeat next byte (256-n)+1 times
+            if i < len(data):
+                count = (256 - n) + 1
+                result.extend([data[i]] * count)
+                i += 1
+
+    return bytes(result[:expected_size])
+
+
+def unpack_rle_bitpacked(data: bytes, expected_pixels: int, depth: int) -> bytes:
+    """
+    Decompress bit-packed RLE data (icon.library format for image).
+    Control bytes are 8 bits, data values are 'depth' bits each.
+    Based on icon.library decompressdata routine.
+    """
+    if depth == 8:
+        return unpack_rle_8bit(data, expected_pixels)
+
+    result = bytearray()
+
+    # Bit buffer for reading from the packed stream
+    bit_buffer = 0
+    bits_in_buffer = 0
+    data_pos = 0
+
+    def read_bits(num_bits: int) -> int:
+        nonlocal bit_buffer, bits_in_buffer, data_pos
+
+        while bits_in_buffer < num_bits:
+            if data_pos >= len(data):
+                return -1
+            byte = data[data_pos]
+            data_pos += 1
+            bit_buffer = (bit_buffer << 8) | byte
+            bits_in_buffer += 8
+
+        bits_in_buffer -= num_bits
+        value = (bit_buffer >> bits_in_buffer) & ((1 << num_bits) - 1)
+        return value
+
+    while len(result) < expected_pixels and data_pos < len(data):
+        # Read 8-bit control byte
+        control = read_bits(8)
+        if control < 0:
+            break
+
+        # Sign-extend the control byte
+        if control >= 128:
+            control = control - 256
+
+        if control >= 0:
+            # Literal run: copy (control + 1) pixel values
+            count = control + 1
+            for _ in range(count):
+                if len(result) >= expected_pixels:
+                    break
+                pixel = read_bits(depth)
+                if pixel < 0:
+                    break
+                result.append(pixel)
+        else:
+            # Repeat run: repeat next pixel value (-control + 1) times
+            count = -control + 1
+            pixel = read_bits(depth)
+            if pixel < 0:
+                break
+            for _ in range(count):
+                if len(result) >= expected_pixels:
+                    break
+                result.append(pixel)
+
+    return bytes(result)
+
+
+def parse_glowicons(data: bytes) -> Optional[Dict]:
+    """
+    Parse GlowIcons FORM ICON data.
+    Returns dict with 'width', 'height', 'rgba', 'has_select', 'select_rgba' or None.
+    """
+    if len(data) < 12 or data[0:4] != b"FORM" or data[8:12] != b"ICON":
+        return None
+
+    form_size = struct.unpack(">I", data[4:8])[0]
+    pos = 12  # Skip "FORM" + size + "ICON"
+
+    face_info = None
+    images = []
+
+    while pos < min(len(data), form_size + 8):
+        if pos + 8 > len(data):
+            break
+
+        chunk_id = data[pos:pos + 4]
+        chunk_size = struct.unpack(">I", data[pos + 4:pos + 8])[0]
+        chunk_data = data[pos + 8:pos + 8 + chunk_size]
+
+        if chunk_id == b"FACE":
+            # FACE chunk: width-1, height-1, flags, aspect
+            if len(chunk_data) >= 4:
+                face_info = {
+                    "width": chunk_data[0] + 1,
+                    "height": chunk_data[1] + 1,
+                    "flags": chunk_data[2],
+                    "aspect": chunk_data[3],
+                }
+        elif chunk_id == b"IMAG":
+            img = parse_imag_chunk(chunk_data, face_info)
+            if img:
+                images.append(img)
+        elif chunk_id == b"ARGB":
+            img = parse_argb_chunk(chunk_data)
+            if img:
+                images.append(img)
+
+        # Move to next chunk (aligned to word boundary)
+        pos += 8 + chunk_size
+        if chunk_size % 2:
+            pos += 1
+
+    if not images:
+        return None
+
+    result = {
+        "width": images[0]["width"],
+        "height": images[0]["height"],
+        "rgba": images[0]["rgba"],
+        "has_select": len(images) > 1,
+    }
+    if len(images) > 1:
+        result["select_rgba"] = images[1]["rgba"]
+        result["select_width"] = images[1]["width"]
+        result["select_height"] = images[1]["height"]
+
+    return result
+
+
+def parse_imag_chunk(data: bytes, face_info: Optional[Dict]) -> Optional[Dict]:
+    """
+    Parse IMAG chunk (palette-mapped compressed image).
+
+    IMAG header (10 bytes):
+      $00 byte transparent color number
+      $01 byte number of colors - 1
+      $02 byte flags (bit0=transparency)
+      $03 byte compressed image flag
+      $04 byte compressed colormap flag
+      $05 byte depth (bits per pixel)
+      $06 word compressed image size - 1
+      $08 word compressed colormap size - 1
+
+    Data order: IMAGE data first, then COLORMAP data.
+    """
+    if len(data) < 10 or not face_info:
+        return None
+
+    width = face_info["width"]
+    height = face_info["height"]
+
+    transparent_color = data[0]
+    num_colors = data[1] + 1
+    flags = data[2]
+    image_compressed = data[3] != 0
+    colormap_compressed = data[4] != 0
+    depth = data[5]
+    image_size = struct.unpack(">H", data[6:8])[0] + 1
+    colormap_size = struct.unpack(">H", data[8:10])[0] + 1
+
+    has_transparency = (flags & 1) != 0
+
+    pos = 10  # After header
+    expected_pixels = width * height
+
+    # Data order: IMAGE first, then COLORMAP
+    # Read image data
+    if image_size > 1 and pos + image_size <= len(data):
+        raw_image_data = data[pos:pos + image_size]
+        pos += image_size
+    else:
+        raw_image_data = data[pos:]
+        pos = len(data)
+
+    # Read colormap data
+    palette = None
+    if colormap_size > 1 and pos + colormap_size <= len(data):
+        raw_colormap_data = data[pos:pos + colormap_size]
+
+        # Decompress colormap (8-bit RLE)
+        if colormap_compressed:
+            colormap_data = unpack_rle_8bit(raw_colormap_data, num_colors * 3)
+        else:
+            colormap_data = raw_colormap_data
+
+        # Parse RGB palette
+        palette = []
+        for i in range(0, min(len(colormap_data), num_colors * 3), 3):
+            if i + 2 < len(colormap_data):
+                palette.append((colormap_data[i], colormap_data[i + 1], colormap_data[i + 2]))
+
+    # Decompress image data
+    if image_compressed:
+        image_data = unpack_rle_bitpacked(raw_image_data, expected_pixels, depth)
+    else:
+        image_data = raw_image_data
+
+    if len(image_data) < expected_pixels:
+        return None
+
+    # Use default palette if none provided
+    if palette is None or len(palette) == 0:
+        if num_colors <= 4:
+            palette = WB13_COLORS[:4]
+        elif num_colors <= 8:
+            palette = WB20_COLORS
+        else:
+            palette = PALETTE_16
+
+    # Convert indexed to RGBA
+    rgba = bytearray(width * height * 4)
+    for i in range(width * height):
+        idx = image_data[i] if i < len(image_data) else 0
+        if idx < len(palette):
+            r, g, b = palette[idx]
+        else:
+            r, g, b = 0, 0, 0
+
+        if has_transparency and idx == transparent_color:
+            a = 0
+        else:
+            a = 255
+
+        rgba[i * 4] = r
+        rgba[i * 4 + 1] = g
+        rgba[i * 4 + 2] = b
+        rgba[i * 4 + 3] = a
+
+    return {"width": width, "height": height, "rgba": bytes(rgba)}
+
+
+def parse_argb_chunk(data: bytes) -> Optional[Dict]:
+    """Parse ARGB chunk (OS4 true-color format)."""
+    if len(data) < 4:
+        return None
+
+    width = struct.unpack(">H", data[0:2])[0]
+    height = struct.unpack(">H", data[2:4])[0]
+
+    if width == 0 or height == 0:
+        return None
+
+    expected_size = width * height * 4
+    pixel_data = data[4:]
+
+    if len(pixel_data) < expected_size:
+        return None
+
+    # ARGB to RGBA conversion
+    rgba = bytearray(expected_size)
+    for i in range(width * height):
+        offset = i * 4
+        a = pixel_data[offset]
+        r = pixel_data[offset + 1]
+        g = pixel_data[offset + 2]
+        b = pixel_data[offset + 3]
+        rgba[offset] = r
+        rgba[offset + 1] = g
+        rgba[offset + 2] = b
+        rgba[offset + 3] = a
+
+    return {"width": width, "height": height, "rgba": bytes(rgba)}
 
 def parse_icon_file(path: str, strict: bool) -> ParsedIcon:
     data = bytearray(open(path, "rb").read())
@@ -443,10 +795,21 @@ def parse_icon_file(path: str, strict: bool) -> ParsedIcon:
 
     drawerdata2 = None
     if has_drawerdata and revision == 1:
-        if strict and pos + DRAWERDATA2_LEN > len(data):
-            raise ValueError("DrawerData2 out of range")
-        drawerdata2 = bytes(data[pos:pos + DRAWERDATA2_LEN])
-        pos += DRAWERDATA2_LEN
+        if pos + DRAWERDATA2_LEN > len(data):
+            if strict:
+                raise ValueError("DrawerData2 out of range")
+            # Non-strict: only read if we have at least some data
+            # (icon.library handles truncated files gracefully)
+            remaining = len(data) - pos
+            if remaining > 0:
+                # Pad with zeros if truncated
+                drawerdata2 = bytes(data[pos:pos + DRAWERDATA2_LEN])
+                if len(drawerdata2) < DRAWERDATA2_LEN:
+                    drawerdata2 = drawerdata2 + bytes(DRAWERDATA2_LEN - len(drawerdata2))
+                pos = len(data)  # We've consumed everything
+        else:
+            drawerdata2 = bytes(data[pos:pos + DRAWERDATA2_LEN])
+            pos += DRAWERDATA2_LEN
 
     glowicons = detect_glowicons_tail(data, pos)
 
@@ -603,11 +966,18 @@ def rebuild_file(icon: ParsedIcon, new_tooltypes: Optional[List[bytes]], compact
             raise ValueError("ToolWindow flagged but missing")
         out += icon.toolwindow
 
-    # DrawerData2
-    if icon.has_drawerdata and icon.revision == 1:
-        if icon.drawerdata2 is None:
-            raise ValueError("DrawerData2 expected but missing")
-        out += icon.drawerdata2
+    # DrawerData2 (dd_Flags + dd_ViewModes, 6 bytes)
+    # Write if: drawerdata2 exists OR (has_drawerdata AND revision >= 1)
+    # Per icon.library: dd_Flags/dd_ViewModes are written after ToolWindow if DrawerData present
+    if icon.drawerdata2 is not None:
+        # Ensure we write exactly 6 bytes
+        dd2 = icon.drawerdata2
+        if len(dd2) < DRAWERDATA2_LEN:
+            dd2 = dd2 + bytes(DRAWERDATA2_LEN - len(dd2))
+        out += dd2[:DRAWERDATA2_LEN]
+    elif icon.has_drawerdata and icon.revision >= 1:
+        # Revision 1+ expects dd_Flags/dd_ViewModes but we don't have them - write zeros
+        out += bytes(DRAWERDATA2_LEN)
 
     # GlowIcons / extra tail
     if icon.glowicons:
@@ -716,9 +1086,12 @@ def dump_icon_verbose(icon: ParsedIcon) -> None:
         for idx, entry in enumerate(icon.tooltypes_raw_entries):
             print(f'ToolTypes[{idx}]="{bytes_to_tt_str(entry)}"')
 
-    # DrawerData2 for OS 2.x
+    # DrawerData2 for OS 2.x (dd_Flags + dd_ViewModes)
     if icon.drawerdata2:
         dump_fields("DrawerData2", icon.drawerdata2, DRAWERDATA2_FIELDS)
+    elif icon.has_drawerdata and icon.revision >= 1:
+        # Expected but not present in file
+        print("DrawerData2: (expected but not found in file)")
 
 
 # --- Structured editing ---
@@ -757,6 +1130,14 @@ def find_field_by_path(path: str) -> Tuple[Optional[FieldDef], str, int]:
             for f in NEWWINDOW_FIELDS:
                 if f.name == parts[2]:
                     return f, "NewWindow", 0
+            return None, "", 0
+
+    elif parts[0] == "DrawerData2":
+        # DrawerData2:Flags or DrawerData2:ViewModes
+        if len(parts) == 2:
+            for f in DRAWERDATA2_FIELDS:
+                if f.name == parts[1]:
+                    return f, "DrawerData2", 0
             return None, "", 0
 
     elif parts[0] in ("Icon", "IconSelect"):
@@ -825,6 +1206,28 @@ def apply_edit(icon: ParsedIcon, edit_spec: str) -> bool:
         icon.drawerdata = bytes(dd)
         return True
 
+    elif struct_name == "DrawerData2":
+        # Editing dd_Flags or dd_ViewModes
+        if not icon.has_drawerdata:
+            print(f"No DrawerData in this icon (required for DrawerData2)", file=sys.stderr)
+            return False
+        # Ensure we have a drawerdata2 buffer, creating one if needed
+        if icon.drawerdata2 is None:
+            # Create default DrawerData2 (dd_Flags=0, dd_ViewModes=0)
+            icon.drawerdata2 = bytes(6)
+        dd2 = bytearray(icon.drawerdata2)
+        # Extend if needed
+        while len(dd2) < DRAWERDATA2_LEN:
+            dd2.append(0)
+        write_field(dd2, field.offset, field.size, field.signed, value)
+        icon.drawerdata2 = bytes(dd2)
+        # Ensure revision is set to 1 (required for DrawerData2 to be recognized)
+        if icon.revision != 1:
+            icon.revision = 1
+            # Update UserData low byte in DiskObject header
+            icon.data[OFF_ICON_REVISION + 3] = 1
+        return True
+
     elif struct_name in ("Icon", "IconSelect"):
         if not icon.main_icons_blob:
             print(f"No icon images in this file", file=sys.stderr)
@@ -845,6 +1248,59 @@ def apply_edit(icon: ParsedIcon, edit_spec: str) -> bool:
 
 
 # --- PNG export/import ---
+
+def find_edge_background(pixels: List[List[int]], width: int, height: int) -> List[List[bool]]:
+    """Find color 0 pixels connected to the image edge using flood fill.
+
+    Returns a 2D array of booleans - True for pixels that should be transparent
+    (color 0 and connected to the edge), False otherwise.
+
+    This properly handles icons with color 0 used both for transparent background
+    AND as an interior color (e.g., gray in MagicWB icons).
+    """
+    from collections import deque
+
+    # Result: True = this pixel should be transparent
+    is_edge = [[False] * width for _ in range(height)]
+
+    # Use a queue for flood fill from all edge pixels that are color 0
+    queue = deque()
+
+    # Add all edge pixels that are color 0 to the queue
+    for x in range(width):
+        # Top edge
+        if pixels[0][x] == 0 and not is_edge[0][x]:
+            is_edge[0][x] = True
+            queue.append((x, 0))
+        # Bottom edge
+        if pixels[height - 1][x] == 0 and not is_edge[height - 1][x]:
+            is_edge[height - 1][x] = True
+            queue.append((x, height - 1))
+
+    for y in range(height):
+        # Left edge
+        if pixels[y][0] == 0 and not is_edge[y][0]:
+            is_edge[y][0] = True
+            queue.append((0, y))
+        # Right edge
+        if pixels[y][width - 1] == 0 and not is_edge[y][width - 1]:
+            is_edge[y][width - 1] = True
+            queue.append((width - 1, y))
+
+    # Flood fill to find all connected color 0 pixels
+    while queue:
+        x, y = queue.popleft()
+
+        # Check 4 neighbors
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < width and 0 <= ny < height:
+                if pixels[ny][nx] == 0 and not is_edge[ny][nx]:
+                    is_edge[ny][nx] = True
+                    queue.append((nx, ny))
+
+    return is_edge
+
 
 def get_icon_image_info(blob: bytes, icon_index: int) -> Tuple[int, int, int, int, int]:
     """
@@ -915,16 +1371,57 @@ def encode_chunky_to_planar(pixels: List[List[int]], width: int, height: int, de
     return bytes(data)
 
 
-def export_icon_to_png(icon: ParsedIcon, icon_index: int, output_path: str) -> bool:
+def export_icon_to_png(icon: ParsedIcon, icon_index: int, output_path: str,
+                       transparency: str = "edge", force_planar: bool = False) -> bool:
     """
-    Export an icon image to PNG file.
+    Export an icon image to PNG file with configurable transparency.
     icon_index: 0 for main icon, 1 for select icon.
+    transparency: "edge" = only edge-connected color 0, "all" = all color 0, "none" = opaque
+    force_planar: if True, skip GlowIcons and export traditional planar images
     Returns True on success.
+
+    Prefers GlowIcons (FORM ICON) when available as they are higher quality.
+    Falls back to traditional planar images otherwise.
     """
     if not HAS_PNG:
         print("PNG export requires pypng library. Install with: pip install pypng", file=sys.stderr)
         return False
 
+    # Try GlowIcons first (higher quality) unless --planar is specified
+    if icon.glowicons and not force_planar:
+        glow = parse_glowicons(icon.glowicons)
+        if glow:
+            # Check if we have the requested image
+            if icon_index == 0:
+                rgba = glow["rgba"]
+                width = glow["width"]
+                height = glow["height"]
+            elif icon_index == 1 and glow.get("has_select"):
+                rgba = glow["select_rgba"]
+                width = glow.get("select_width", glow["width"])
+                height = glow.get("select_height", glow["height"])
+            else:
+                rgba = None
+
+            if rgba:
+                # GlowIcons already have proper transparency from the IMAG/ARGB chunks
+                # Convert to PNG rows
+                rgba_rows = []
+                for y in range(height):
+                    row = []
+                    for x in range(width):
+                        offset = (y * width + x) * 4
+                        row.extend([rgba[offset], rgba[offset+1], rgba[offset+2], rgba[offset+3]])
+                    rgba_rows.append(row)
+
+                with open(output_path, 'wb') as f:
+                    writer = png.Writer(width=width, height=height, greyscale=False, alpha=True)
+                    writer.write(f, rgba_rows)
+
+                print(f"  (exported from GlowIcons FORM ICON data)")
+                return True
+
+    # Fall back to traditional planar images
     if not icon.main_icons_blob:
         print("No icon images in this file", file=sys.stderr)
         return False
@@ -941,21 +1438,41 @@ def export_icon_to_png(icon: ParsedIcon, icon_index: int, output_path: str) -> b
 
     pixels = decode_planar_to_chunky(icon.main_icons_blob, pos, width, height, depth)
 
-    # Choose palette based on Workbench version
-    palette = WB20_COLORS if icon.revision >= 1 else WB13_COLORS
+    # Choose palette based on depth and Workbench version
+    # Deep icons (4+ planes) use the extended 16-color MagicWB palette
+    if depth > 3:
+        palette = PALETTE_16
+    elif icon.revision >= 1:
+        palette = WB20_COLORS
+    else:
+        palette = WB13_COLORS
 
-    # Convert to RGB rows for PNG
-    rgb_rows = []
+    # Determine transparency based on mode
+    if transparency == "edge":
+        edge_transparent = find_edge_background(pixels, width, height)
+    else:
+        edge_transparent = None
+
+    # Convert to RGBA rows for PNG
+    rgba_rows = []
     for y in range(height):
         row = []
         for x in range(width):
             idx = pixels[y][x] % len(palette)
-            row.extend(palette[idx])
-        rgb_rows.append(row)
+            r, g, b = palette[idx]
+            # Apply transparency based on mode
+            if transparency == "none":
+                a = 255
+            elif transparency == "all":
+                a = 0 if idx == 0 else 255
+            else:  # edge
+                a = 0 if (idx == 0 and edge_transparent[y][x]) else 255
+            row.extend([r, g, b, a])
+        rgba_rows.append(row)
 
     with open(output_path, 'wb') as f:
-        writer = png.Writer(width=width, height=height, greyscale=False)
-        writer.write(f, rgb_rows)
+        writer = png.Writer(width=width, height=height, greyscale=False, alpha=True)
+        writer.write(f, rgba_rows)
 
     return True
 
@@ -980,6 +1497,9 @@ def import_png_to_icon(icon: ParsedIcon, icon_index: int, png_path: str) -> bool
     Import a PNG file into an icon image slot.
     icon_index: 0 for main icon, 1 for select icon.
     Returns True on success.
+
+    Supports RGBA PNGs - transparent pixels are mapped to color 0 (background).
+    Automatically selects best palette (WB1.3, WB2.0, or 16-color MagicWB).
     """
     if not HAS_PNG:
         print("PNG import requires pypng library. Install with: pip install pypng", file=sys.stderr)
@@ -1001,46 +1521,73 @@ def import_png_to_icon(icon: ParsedIcon, icon_index: int, png_path: str) -> bool
     has_alpha = metadata.get('alpha', False)
     pixel_size = 4 if has_alpha else 3
 
-    # Quantize to both palettes and pick best
-    pixels_wb13 = [[0] * width for _ in range(height)]
-    pixels_wb20 = [[0] * width for _ in range(height)]
-    max_dist_wb13 = 0
-    max_dist_wb20 = 0
+    # Check for transparency
+    has_transparent_pixels = False
+    if has_alpha:
+        for row in rows:
+            for x in range(width):
+                offset = x * pixel_size + 3  # Alpha channel
+                if row[offset] < 128:  # Semi-transparent or fully transparent
+                    has_transparent_pixels = True
+                    break
+            if has_transparent_pixels:
+                break
 
-    for y, row in enumerate(rows):
-        for x in range(width):
-            offset = x * pixel_size
-            r, g, b = row[offset], row[offset + 1], row[offset + 2]
+    # Quantize to all three palettes and pick best
+    palettes = [
+        ("WB1.3", WB13_COLORS, 3),
+        ("WB2.0", WB20_COLORS, 3),
+        ("16-color", PALETTE_16, 4),
+    ]
 
-            idx13, dist13 = quantize_to_palette(r, g, b, WB13_COLORS)
-            pixels_wb13[y][x] = idx13
-            max_dist_wb13 = max(max_dist_wb13, dist13)
+    best_result = None
+    best_max_dist = float('inf')
+    best_palette_name = ""
+    best_depth = 3
 
-            idx20, dist20 = quantize_to_palette(r, g, b, WB20_COLORS)
-            pixels_wb20[y][x] = idx20
-            max_dist_wb20 = max(max_dist_wb20, dist20)
+    for palette_name, palette, max_depth in palettes:
+        pixels = [[0] * width for _ in range(height)]
+        max_dist = 0
 
-    # Choose palette with lower max error
-    if max_dist_wb13 <= max_dist_wb20:
-        pixels = pixels_wb13
-        palette_name = "WB1.3"
-        max_dist = max_dist_wb13
-    else:
-        pixels = pixels_wb20
-        palette_name = "WB2.0"
-        max_dist = max_dist_wb20
+        for y, row in enumerate(rows):
+            for x in range(width):
+                offset = x * pixel_size
+                r, g, b = row[offset], row[offset + 1], row[offset + 2]
 
-    # Determine minimum depth needed
-    max_color = max(max(row) for row in pixels)
-    if max_color <= 1:
-        depth = 1
-    elif max_color <= 3:
-        depth = 2
-    else:
-        depth = 3
+                # Check for transparency
+                if has_alpha:
+                    a = row[offset + 3]
+                    if a < 128:
+                        # Transparent pixel -> color 0 (background)
+                        pixels[y][x] = 0
+                        continue
 
-    print(f"Mapping to {palette_name} palette, depth={depth}, max_color_error={max_dist}")
-    if max_dist > 1000:
+                idx, dist = quantize_to_palette(r, g, b, palette)
+                pixels[y][x] = idx
+                max_dist = max(max_dist, dist)
+
+        if max_dist < best_max_dist:
+            best_max_dist = max_dist
+            best_result = pixels
+            best_palette_name = palette_name
+            # Determine depth based on max color index used
+            max_color = max(max(row) for row in pixels)
+            if max_color <= 1:
+                best_depth = 1
+            elif max_color <= 3:
+                best_depth = 2
+            elif max_color <= 7:
+                best_depth = 3
+            else:
+                best_depth = 4
+
+    pixels = best_result
+    depth = best_depth
+
+    print(f"Mapping to {best_palette_name} palette, depth={depth}, max_color_error={best_max_dist}")
+    if has_transparent_pixels:
+        print(f"Transparent pixels mapped to color 0 (background)")
+    if best_max_dist > 1000:
         print("Warning: significant color error - consider adjusting source image")
 
     # Encode to planar format
@@ -1118,6 +1665,11 @@ def main() -> int:
     ap.add_argument("--export-select-icon", metavar="PATH", help="Export select icon to PNG file")
     ap.add_argument("--import-icon", metavar="PATH", help="Import PNG file as main icon")
     ap.add_argument("--import-select-icon", metavar="PATH", help="Import PNG file as select icon")
+    ap.add_argument("--transparency", choices=["edge", "all", "none"], default="edge",
+                    help="Transparency mode for PNG export: 'edge' (default) = only edge-connected color 0, "
+                         "'all' = all color 0 pixels, 'none' = no transparency")
+    ap.add_argument("--planar", action="store_true",
+                    help="Force export of planar images (skip GlowIcons even if present)")
 
     # Other options
     ap.add_argument("-o", "--output", metavar="PATH", help="Write to separate output file (non-destructive)")
@@ -1234,13 +1786,13 @@ def main() -> int:
 
         # PNG export (read-only, no change to file)
         if args.export_icon:
-            if export_icon_to_png(icon, 0, args.export_icon):
+            if export_icon_to_png(icon, 0, args.export_icon, args.transparency, args.planar):
                 print(f"{info_path}: exported main icon to {args.export_icon}")
             else:
                 rc = 1
 
         if args.export_select_icon:
-            if export_icon_to_png(icon, 1, args.export_select_icon):
+            if export_icon_to_png(icon, 1, args.export_select_icon, args.transparency, args.planar):
                 print(f"{info_path}: exported select icon to {args.export_select_icon}")
             else:
                 rc = 1
